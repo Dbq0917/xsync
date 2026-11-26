@@ -386,6 +386,83 @@ func TestMapRange_NestedDelete(t *testing.T) {
 	}
 }
 
+func TestMapRange_NestedDeleteLargeScale(t *testing.T) {
+	// Deleting entries that the iteration has not visited yet must not
+	// corrupt the walk: every still-present entry is visited exactly once
+	// and no entry is reported twice.
+	const numEntries = 100_000
+	m := NewMap[int, int](WithPresize(numEntries))
+	for i := range numEntries {
+		m.Store(i, i)
+	}
+	visited := make(map[int]struct{}, numEntries)
+	m.Range(func(key int, value int) bool {
+		if key != value {
+			t.Fatalf("got unexpected key/value: %v/%v", key, value)
+		}
+		if _, seen := visited[key]; seen {
+			t.Fatalf("key visited more than once: %d", key)
+		}
+		visited[key] = struct{}{}
+		// Delete both the current key and a key that has not been
+		// visited yet (higher keys are iterated later only on average,
+		// so the deletion is simply attempted when the key still exists).
+		m.Delete(key)
+		m.Delete((key + numEntries/2) % numEntries)
+		return true
+	})
+	if m.Size() != 0 {
+		t.Fatalf("map was expected to be empty, got size: %d", m.Size())
+	}
+}
+
+func TestMapRange_ConcurrentMutationsLargeScale(t *testing.T) {
+	// Concurrent inserts and deletes (which force repeated grow/shrink
+	// resizes) must not make Range visit a key twice, loop forever, or
+	// observe an inconsistent key/value pair. Newly inserted entries are
+	// allowed to be missed by the current round, but they cannot extend
+	// the iteration indefinitely.
+	const numEntries = 100_000
+	m := NewMap[int, int](WithPresize(numEntries))
+	for i := range numEntries {
+		m.Store(i, i)
+	}
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; !stop.Load(); j++ {
+				key := (j*7 + 3) % (numEntries * 2)
+				if j&1 == 0 {
+					m.Store(key, key)
+				} else {
+					m.Delete(key)
+				}
+			}
+		}()
+	}
+	for range 5 {
+		seen := make(map[int]struct{}, numEntries)
+		m.Range(func(key int, value int) bool {
+			if key != value {
+				t.Fatalf("got inconsistent key/value: %v/%v", key, value)
+			}
+			if _, dup := seen[key]; dup {
+				t.Fatalf("key visited more than once: %d", key)
+			}
+			seen[key] = struct{}{}
+			return true
+		})
+		if len(seen) == 0 {
+			t.Fatal("no entries were visited")
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+}
+
 func TestMapRangeRelaxed(t *testing.T) {
 	const numEntries = 1000
 	m := NewMap[string, int]()
@@ -2332,6 +2409,32 @@ func BenchmarkMapRange(b *testing.B) {
 			_ = foo
 		}
 	})
+}
+
+func BenchmarkMapRange_LargeScale(b *testing.B) {
+	// Single-goroutine full scan over a large table. Run with -benchmem
+	// to observe that the per-bucket walk keeps allocations bounded to a
+	// single small reusable buffer instead of snapshotting the whole map.
+	for _, numEntries := range []int{100_000, 1_000_000} {
+		b.Run("entries="+strconv.Itoa(numEntries), func(b *testing.B) {
+			m := NewMap[int, int](WithPresize(numEntries))
+			for i := range numEntries {
+				m.Store(i, i)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				visited := 0
+				m.Range(func(key int, value int) bool {
+					visited++
+					return true
+				})
+				if visited != numEntries {
+					b.Fatalf("visited %d entries, expected %d", visited, numEntries)
+				}
+			}
+		})
+	}
 }
 
 func BenchmarkMapRangeRelaxed(b *testing.B) {
