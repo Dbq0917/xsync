@@ -1,5 +1,7 @@
 package xsync
 
+import "hash/maphash"
+
 const (
 	EntriesPerMapBucket           = entriesPerMapBucket
 	MapLoadFactor                 = mapLoadFactor
@@ -47,4 +49,15 @@ func NextPowOf2(v uint64) uint64 {
 
 func HashUint64(seed, v uint64) uint64 {
 	return hashUint64(seed, v)
+}
+
+func MapBucketIndex[K comparable, V any](m *Map[K, V], key K) uint64 {
+	table := m.table.Load()
+	var hash uint64
+	if m.intKey {
+		hash = hashUint64(table.intSeed, toUint64(key))
+	} else {
+		hash = maphash.Comparable(table.seed, key)
+	}
+	return uint64(len(table.buckets)-1) & h1(hash)
 }

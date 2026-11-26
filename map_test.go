@@ -968,6 +968,220 @@ func TestMapLoadOrCompute_ConcurrentExistingKey(t *testing.T) {
 	}
 }
 
+func TestMapLoadOrCompute_ConcurrentDifferentKeysSameBucket(t *testing.T) {
+	m := NewMap[int, int]()
+	k1 := 0
+	k2 := 1
+	bucket := MapBucketIndex(m, k1)
+	for MapBucketIndex(m, k2) != bucket {
+		k2++
+	}
+
+	started := make(chan int, 2)
+	release := make(chan struct{})
+	start := make(chan struct{})
+	var released bool
+	unblock := func() {
+		if !released {
+			released = true
+			close(release)
+		}
+	}
+	defer unblock()
+
+	type result struct {
+		key    int
+		value  int
+		loaded bool
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, key := range []int{k1, k2} {
+		key := key
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			value, loaded := m.LoadOrCompute(key, func() (int, bool) {
+				started <- key
+				<-release
+				return key + 1, false
+			})
+			results <- result{key: key, value: value, loaded: loaded}
+		}()
+	}
+	close(start)
+
+	timedOut := false
+	startedCount := 0
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for startedCount < 2 {
+		select {
+		case <-started:
+			startedCount++
+		case <-timer.C:
+			timedOut = true
+			startedCount = 2
+		}
+	}
+	unblock()
+	wg.Wait()
+	close(results)
+
+	if timedOut {
+		t.Fatal("computations for different keys in the same bucket were serialized")
+	}
+	for r := range results {
+		if r.loaded {
+			t.Errorf("key %d: expected computed value, got loaded", r.key)
+		}
+		if r.value != r.key+1 {
+			t.Errorf("key %d: expected value %d, got %d", r.key, r.key+1, r.value)
+		}
+	}
+}
+
+func TestMapLoadOrCompute_ConcurrentSameKeyOnce(t *testing.T) {
+	const numGoroutines = 32
+	const key = 1
+	const value = 42
+
+	m := NewMap[int, int]()
+	start := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	var ready sync.WaitGroup
+	ready.Add(numGoroutines)
+	results := make(chan int, numGoroutines)
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+	for range numGoroutines {
+		go func() {
+			defer wg.Done()
+			ready.Done()
+			<-start
+			v, _ := m.LoadOrCompute(key, func() (int, bool) {
+				calls.Add(1)
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				<-release
+				return value, false
+			})
+			results <- v
+		}()
+	}
+	ready.Wait()
+	close(start)
+	<-entered
+	close(release)
+	wg.Wait()
+	close(results)
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected one computation, got %d", got)
+	}
+	for v := range results {
+		if v != value {
+			t.Fatalf("expected value %d, got %d", value, v)
+		}
+	}
+}
+
+func TestMapLoadOrCompute_NoDuplicateOnResize(t *testing.T) {
+	const key = 1_000_000
+	m := NewMap[int, int]()
+	for i := range 100 {
+		m.Store(i, i)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	result := make(chan int, 1)
+	go func() {
+		v, loaded := m.LoadOrCompute(key, func() (int, bool) {
+			calls.Add(1)
+			close(entered)
+			<-release
+			return 42, false
+		})
+		if loaded {
+			result <- -1
+			return
+		}
+		result <- v
+	}()
+
+	<-entered
+	for i := 100; i < 10_000; i++ {
+		m.Store(i, i)
+	}
+	close(release)
+	v := <-result
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected one computation, got %d", got)
+	}
+	if v != 42 {
+		t.Fatalf("expected value 42, got %d", v)
+	}
+	if v, loaded := m.Load(key); !loaded || v != 42 {
+		t.Fatalf("expected stored value 42, got %d (loaded=%v)", v, loaded)
+	}
+}
+
+func TestMapCompute_PanicLeavesBucketConsistent(t *testing.T) {
+	m := NewMap[int, int]()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic")
+			}
+		}()
+		m.Compute(1, func(oldValue int, loaded bool) (int, ComputeOp) {
+			panic("compute failure")
+		})
+	}()
+
+	if m.Size() != 0 {
+		t.Fatalf("expected empty map, got size %d", m.Size())
+	}
+	v, ok := m.Compute(1, func(oldValue int, loaded bool) (int, ComputeOp) {
+		return 42, UpdateOp
+	})
+	if !ok || v != 42 {
+		t.Fatalf("expected value 42, got %d (ok=%v)", v, ok)
+	}
+}
+
+func TestMapLoadOrCompute_PanicLeavesBucketConsistent(t *testing.T) {
+	m := NewMap[int, int]()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic")
+			}
+		}()
+		m.LoadOrCompute(1, func() (int, bool) {
+			panic("compute failure")
+		})
+	}()
+
+	if m.Size() != 0 {
+		t.Fatalf("expected empty map, got size %d", m.Size())
+	}
+	v, loaded := m.LoadOrCompute(1, func() (int, bool) {
+		return 42, false
+	})
+	if loaded || v != 42 {
+		t.Fatalf("expected computed value 42, got %d (loaded=%v)", v, loaded)
+	}
+}
+
 func TestMapOfCompute(t *testing.T) {
 	m := NewMap[string, int]()
 	// Store a new value.

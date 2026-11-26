@@ -79,6 +79,16 @@ const (
 	loadAndDeleteOp
 )
 
+type computeCall struct {
+	done chan struct{}
+}
+
+type computeSnapshot[V any] struct {
+	entry  unsafe.Pointer
+	value  V
+	loaded bool
+}
+
 // Deprecated: use [Map]
 type MapOf[K comparable, V any] = Map[K, V]
 
@@ -118,10 +128,14 @@ type Map[K comparable, V any] struct {
 	// used to wake up resize waiters (concurrent writes)
 	resizeCond sync.Cond
 	// transfer progress index for resize
-	resizeIdx   atomic.Int64
-	minTableLen int
-	growOnly    bool
-	intKey      bool
+	resizeIdx atomic.Int64
+	// in-flight user computations, keyed by map key
+	computeCalls sync.Map
+	// number of in-flight user computations
+	activeComputes atomic.Int64
+	minTableLen    int
+	growOnly       bool
+	intKey         bool
 }
 
 type mapTable[K comparable, V any] struct {
@@ -367,6 +381,7 @@ func (m *Map[K, V]) Store(key K, value V) {
 	// it uses a simplified and slightly faster version of it.
 	for {
 	store_attempt:
+		m.waitForCompute(key)
 		var (
 			emptyb   *bucketPadded
 			emptyidx int
@@ -508,15 +523,19 @@ func (m *Map[K, V]) LoadAndStore(key K, value V) (actual V, loaded bool) {
 // cancel value, the computation is cancelled and the zero value
 // for type V is returned.
 //
-// This call locks a hash table bucket while the compute function
-// is executed. It means that modifications on other entries in
-// the bucket will be blocked until the valueFn executes. Consider
-// this when the function includes long-running operations.
+// The compute function is executed outside of hash table bucket
+// locks, so long-running computations do not block operations on
+// other keys. Concurrent computations for the same key are
+// serialized, and the function is invoked only once for concurrent
+// calls when the result is successfully stored.
 func (m *Map[K, V]) LoadOrCompute(
 	key K,
 	valueFn func() (newValue V, cancel bool),
 ) (value V, loaded bool) {
-	return m.doCompute(
+	if value, loaded = m.Load(key); loaded {
+		return value, true
+	}
+	return m.doComputeOutsideBucket(
 		key,
 		func(oldValue V, loaded bool) (V, ComputeOp) {
 			if loaded {
@@ -528,7 +547,7 @@ func (m *Map[K, V]) LoadOrCompute(
 			}
 			return oldValue, CancelOp
 		},
-		loadOrComputeOp,
+		true,
 		false,
 	)
 }
@@ -549,15 +568,14 @@ func (m *Map[K, V]) LoadOrCompute(
 // if a corresponding entry is present, or the zero value
 // otherwise. See the example for a few use cases.
 //
-// This call locks a hash table bucket while the compute function
-// is executed. It means that modifications on other entries in
-// the bucket will be blocked until the valueFn executes. Consider
-// this when the function includes long-running operations.
+// The compute function is executed outside of hash table bucket
+// locks, so long-running computations do not block operations on
+// other keys. Computations for the same key are serialized.
 func (m *Map[K, V]) Compute(
 	key K,
 	valueFn func(oldValue V, loaded bool) (newValue V, op ComputeOp),
 ) (actual V, ok bool) {
-	return m.doCompute(key, valueFn, noLoadOp, true)
+	return m.doComputeOutsideBucket(key, valueFn, false, true)
 }
 
 // LoadAndDelete deletes the value for a key, returning the previous
@@ -579,6 +597,300 @@ func (m *Map[K, V]) Delete(key K) {
 	m.LoadAndDelete(key)
 }
 
+func (m *Map[K, V]) beginCompute(key K) (*computeCall, bool) {
+	call := &computeCall{
+		done: make(chan struct{}),
+	}
+	actual, loaded := m.computeCalls.LoadOrStore(key, call)
+	if loaded {
+		return actual.(*computeCall), false
+	}
+	m.activeComputes.Add(1)
+	return call, true
+}
+
+func (m *Map[K, V]) endCompute(key K, call *computeCall) {
+	m.computeCalls.Delete(key)
+	m.activeComputes.Add(-1)
+	close(call.done)
+}
+
+func (m *Map[K, V]) waitForCompute(key K) {
+	for m.activeComputes.Load() != 0 {
+		call, loaded := m.computeCalls.Load(key)
+		if !loaded {
+			return
+		}
+		<-call.(*computeCall).done
+	}
+}
+
+func (m *Map[K, V]) doComputeOutsideBucket(
+	key K,
+	valueFn func(oldValue V, loaded bool) (V, ComputeOp),
+	loadOrCompute bool,
+	computeOnly bool,
+) (value V, ok bool) {
+	for {
+		call, owner := m.beginCompute(key)
+		if !owner {
+			<-call.done
+			if loadOrCompute {
+				if value, ok = m.Load(key); ok {
+					return value, true
+				}
+			}
+			continue
+		}
+		return m.runCompute(key, call, valueFn, loadOrCompute, computeOnly)
+	}
+}
+
+func (m *Map[K, V]) runCompute(
+	key K,
+	call *computeCall,
+	valueFn func(oldValue V, loaded bool) (V, ComputeOp),
+	loadOrCompute bool,
+	computeOnly bool,
+) (value V, ok bool) {
+	defer m.endCompute(key, call)
+	return m.computeOwned(key, valueFn, loadOrCompute, computeOnly)
+}
+
+func (m *Map[K, V]) computeOwned(
+	key K,
+	valueFn func(oldValue V, loaded bool) (V, ComputeOp),
+	loadOrCompute bool,
+	computeOnly bool,
+) (V, bool) {
+	for {
+		snapshot := m.snapshotCompute(key)
+		if snapshot.loaded && loadOrCompute {
+			return snapshot.value, true
+		}
+		var oldValue V
+		if snapshot.loaded {
+			oldValue = snapshot.value
+		}
+		newValue, op := valueFn(oldValue, snapshot.loaded)
+		value, ok, retry := m.commitCompute(key, snapshot, oldValue, newValue, op, computeOnly)
+		if retry {
+			continue
+		}
+		return value, ok
+	}
+}
+
+func (m *Map[K, V]) snapshotCompute(key K) *computeSnapshot[V] {
+	for {
+		table := m.table.Load()
+		var hash uint64
+		if m.intKey {
+			hash = hashUint64(table.intSeed, toUint64(key))
+		} else {
+			hash = maphash.Comparable(table.seed, key)
+		}
+		h1 := h1(hash)
+		h2 := h2(hash)
+		h2w := broadcast(h2)
+		bidx := uint64(len(table.buckets)-1) & h1
+		rootb := &table.buckets[bidx]
+
+		rootb.mu.Lock()
+		// The following two checks must go in reverse to what's
+		// in the resize method.
+		if seq := resizeSeq(m.resizeCtl.Load()); seq&1 == 1 {
+			rootb.mu.Unlock()
+			m.helpResize(seq)
+			continue
+		}
+		if m.newerTableExists(table) {
+			rootb.mu.Unlock()
+			continue
+		}
+
+		b := rootb
+		for {
+			metaw := b.meta
+			markedw := markZeroBytes(metaw^h2w) & metaMask
+			for markedw != 0 {
+				idx := firstMarkedByteIndex(markedw)
+				eptr := b.entries[idx]
+				if eptr != nil {
+					e := (*entry[K, V])(eptr)
+					if e.key == key {
+						rootb.mu.Unlock()
+						return &computeSnapshot[V]{
+							entry:  eptr,
+							value:  e.value,
+							loaded: true,
+						}
+					}
+				}
+				markedw &= markedw - 1
+			}
+			if b.next == nil {
+				rootb.mu.Unlock()
+				return &computeSnapshot[V]{}
+			}
+			b = (*bucketPadded)(b.next)
+		}
+	}
+}
+
+func (m *Map[K, V]) commitCompute(
+	key K,
+	snapshot *computeSnapshot[V],
+	oldValue V,
+	newValue V,
+	op ComputeOp,
+	computeOnly bool,
+) (actual V, ok bool, retry bool) {
+	for {
+		table := m.table.Load()
+		var hash uint64
+		if m.intKey {
+			hash = hashUint64(table.intSeed, toUint64(key))
+		} else {
+			hash = maphash.Comparable(table.seed, key)
+		}
+		h1 := h1(hash)
+		h2 := h2(hash)
+		h2w := broadcast(h2)
+		bidx := uint64(len(table.buckets)-1) & h1
+		rootb := &table.buckets[bidx]
+
+		rootb.mu.Lock()
+		// The following two checks must go in reverse to what's
+		// in the resize method.
+		if seq := resizeSeq(m.resizeCtl.Load()); seq&1 == 1 {
+			rootb.mu.Unlock()
+			m.helpResize(seq)
+			continue
+		}
+		if m.newerTableExists(table) {
+			rootb.mu.Unlock()
+			continue
+		}
+
+		var (
+			found       bool
+			foundEntry  unsafe.Pointer
+			foundBucket *bucketPadded
+			foundIdx    int
+			emptyb      *bucketPadded
+			emptyidx    int
+			lastBucket  *bucketPadded
+		)
+		b := rootb
+		for {
+			metaw := b.meta
+			markedw := markZeroBytes(metaw^h2w) & metaMask
+			for markedw != 0 {
+				idx := firstMarkedByteIndex(markedw)
+				eptr := b.entries[idx]
+				if eptr != nil {
+					e := (*entry[K, V])(eptr)
+					if e.key == key {
+						found = true
+						foundEntry = eptr
+						foundBucket = b
+						foundIdx = idx
+						break
+					}
+				}
+				markedw &= markedw - 1
+			}
+			if found {
+				break
+			}
+			if emptyb == nil {
+				// Search for empty entries (up to 5 per bucket).
+				emptyw := ^metaw & occupiedMetaMasked
+				if emptyw != 0 {
+					emptyb = b
+					emptyidx = firstMarkedByteIndex(emptyw)
+				}
+			}
+			lastBucket = b
+			if b.next == nil {
+				break
+			}
+			b = (*bucketPadded)(b.next)
+		}
+
+		if snapshot.loaded {
+			if !found || foundEntry != snapshot.entry {
+				rootb.mu.Unlock()
+				return actual, false, true
+			}
+			switch op {
+			case DeleteOp:
+				// First we update the hash, then the entry.
+				newmetaw := setByte(foundBucket.meta, 0, foundIdx)
+				atomic.StoreUint64(&foundBucket.meta, newmetaw)
+				atomic.StorePointer(&foundBucket.entries[foundIdx], nil)
+				rootb.mu.Unlock()
+				table.addSize(bidx, -1)
+				// Might need to shrink the table if we left bucket empty.
+				if newmetaw == 0 {
+					m.resize(table, mapShrinkHint)
+				}
+				return oldValue, !computeOnly, false
+			case UpdateOp:
+				newe := new(entry[K, V])
+				newe.key = key
+				newe.value = newValue
+				atomic.StorePointer(&foundBucket.entries[foundIdx], unsafe.Pointer(newe))
+				rootb.mu.Unlock()
+				return newValue, true, false
+			default:
+				rootb.mu.Unlock()
+				return oldValue, true, false
+			}
+		}
+
+		if found {
+			rootb.mu.Unlock()
+			return actual, false, true
+		}
+		switch op {
+		case DeleteOp, CancelOp:
+			rootb.mu.Unlock()
+			return *new(V), false, false
+		default:
+			if emptyb != nil {
+				newe := new(entry[K, V])
+				newe.key = key
+				newe.value = newValue
+				// First we update meta, then the entry.
+				atomic.StoreUint64(&emptyb.meta, setByte(emptyb.meta, h2, emptyidx))
+				atomic.StorePointer(&emptyb.entries[emptyidx], unsafe.Pointer(newe))
+				rootb.mu.Unlock()
+				table.addSize(bidx, 1)
+				return newValue, computeOnly, false
+			}
+			growThreshold := float64(len(table.buckets)) * entriesPerMapBucket * mapLoadFactor
+			if table.sumSize() > int64(growThreshold) {
+				rootb.mu.Unlock()
+				m.resize(table, mapGrowHint)
+				continue
+			}
+			// Create and append a bucket.
+			newb := new(bucketPadded)
+			newb.meta = setByte(0, h2, 0)
+			newe := new(entry[K, V])
+			newe.key = key
+			newe.value = newValue
+			newb.entries[0] = unsafe.Pointer(newe)
+			atomic.StorePointer(&lastBucket.next, unsafe.Pointer(newb))
+			rootb.mu.Unlock()
+			table.addSize(bidx, 1)
+			return newValue, computeOnly, false
+		}
+	}
+}
+
 func (m *Map[K, V]) doCompute(
 	key K,
 	valueFn func(oldValue V, loaded bool) (V, ComputeOp),
@@ -587,6 +899,7 @@ func (m *Map[K, V]) doCompute(
 ) (V, bool) {
 	for {
 	compute_attempt:
+		m.waitForCompute(key)
 		var (
 			emptyb   *bucketPadded
 			emptyidx int
