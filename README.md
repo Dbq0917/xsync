@@ -142,6 +142,31 @@ inserted := q.TryEnqueue("bar")
 item, ok := q.TryDequeue() // string
 ```
 
+#### Batch and blocking dequeue
+
+Consumers that process items in batches do not have to poll with a
+guessed sleep interval. `TryDequeueBatch` takes up to `max` currently
+available items without blocking, while `DequeueBatch` parks the goroutine
+when the queue is empty and wakes it as soon as a producer enqueues an
+item:
+
+```go
+// Block until a batch is available; returns ctx.Err() on cancellation.
+batch, err := q.DequeueBatch(ctx, 32) // []string
+
+// Or bound the wait with a timeout (ok == false on timeout).
+batch, ok := q.DequeueBatchTimeout(32, 50*time.Millisecond)
+
+// Zero-allocation variant that fills a caller-owned buffer.
+n, err := q.DequeueInto(ctx, make([]string, 32))
+```
+
+Cancelling `ctx` (or hitting the timeout) wakes the parked goroutine and
+releases its waiter registration immediately; there is no waiter list to
+leave a ghost node in. The enqueue path stays lock-free: producers only
+do a single atomic load of the waiter counter on top of the ring
+publication and never take a lock.
+
 The queue is based on the algorithm from the [MPMCQueue](https://github.com/rigtorp/MPMCQueue) C++ library which in its turn references D.Vyukov's [MPMC queue](https://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue). According to the following [classification](https://www.1024cores.net/home/lock-free-algorithms/queues), the queue is array-based, fails on overflow, provides causal FIFO, has blocking producers and consumers.
 
 The idea of the algorithm is to allow parallelism for concurrent producers and consumers by introducing the notion of tickets, i.e. values of two counters, one per producers/consumers. An atomic increment of one of those counters is the only noticeable contention point in queue operations. The rest of the operation avoids contention on writes thanks to the turn-based read/write access for each of the queue items.

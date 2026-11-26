@@ -48,3 +48,25 @@ func NextPowOf2(v uint64) uint64 {
 func HashUint64(seed, v uint64) uint64 {
 	return hashUint64(seed, v)
 }
+
+// MPMCQueueWaitStats is the white-box snapshot of the blocking batch
+// dequeue internals used by tests and benchmarks.
+type MPMCQueueWaitStats struct {
+	Waiting     int64
+	Notifies    int64
+	Wakeups     int64
+	EmptyPasses int64
+}
+
+// GetMPMCQueueWaitStats returns the waiter/spin counters for q.
+func GetMPMCQueueWaitStats[I any](q *MPMCQueue[I]) MPMCQueueWaitStats {
+	if q.wait == nil {
+		return MPMCQueueWaitStats{Waiting: q.waiting.Load()}
+	}
+	return MPMCQueueWaitStats{
+		Waiting:     q.waiting.Load(),
+		Notifies:    q.wait.notifies.Load(),
+		Wakeups:     q.wait.wakeups.Load(),
+		EmptyPasses: q.wait.emptyPasses.Load(),
+	}
+}
