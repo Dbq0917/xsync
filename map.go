@@ -508,10 +508,11 @@ func (m *Map[K, V]) LoadAndStore(key K, value V) (actual V, loaded bool) {
 // cancel value, the computation is cancelled and the zero value
 // for type V is returned.
 //
-// This call locks a hash table bucket while the compute function
-// is executed. It means that modifications on other entries in
-// the bucket will be blocked until the valueFn executes. Consider
-// this when the function includes long-running operations.
+// The compute function is called without holding any locks, so it
+// may safely call back into the map. Note that the function may be
+// called multiple times in the presence of concurrent modifications
+// of the key, so it should not perform side effects that cannot be
+// safely repeated.
 func (m *Map[K, V]) LoadOrCompute(
 	key K,
 	valueFn func() (newValue V, cancel bool),
@@ -549,10 +550,11 @@ func (m *Map[K, V]) LoadOrCompute(
 // if a corresponding entry is present, or the zero value
 // otherwise. See the example for a few use cases.
 //
-// This call locks a hash table bucket while the compute function
-// is executed. It means that modifications on other entries in
-// the bucket will be blocked until the valueFn executes. Consider
-// this when the function includes long-running operations.
+// The compute function is called without holding any locks, so it
+// may safely call back into the map. Note that the function may be
+// called multiple times in the presence of concurrent modifications
+// of the key, so it should not perform side effects that cannot be
+// safely repeated.
 func (m *Map[K, V]) Compute(
 	key K,
 	valueFn func(oldValue V, loaded bool) (newValue V, op ComputeOp),
@@ -605,36 +607,59 @@ func (m *Map[K, V]) doCompute(
 		bidx := uint64(len(table.buckets)-1) & h1
 		rootb := &table.buckets[bidx]
 
-		if loadOp != noLoadOp {
-			b := rootb
-		load:
-			for {
-				metaw := atomic.LoadUint64(&b.meta)
-				markedw := markZeroBytes(metaw^h2w) & metaMask
-				for markedw != 0 {
-					idx := firstMarkedByteIndex(markedw)
-					eptr := atomic.LoadPointer(&b.entries[idx])
-					if eptr != nil {
-						e := (*entry[K, V])(eptr)
-						if e.key == key {
-							if loadOp == loadOrComputeOp {
-								return e.value, true
-							}
-							break load
+		// Optimistically read the current state of the key without
+		// holding any locks. The state is re-validated under the
+		// bucket lock before the computed result is applied.
+		var (
+			oldv     V
+			loaded   bool
+			oldEntry *entry[K, V]
+		)
+		b := rootb
+	load:
+		for {
+			metaw := atomic.LoadUint64(&b.meta)
+			markedw := markZeroBytes(metaw^h2w) & metaMask
+			for markedw != 0 {
+				idx := firstMarkedByteIndex(markedw)
+				eptr := atomic.LoadPointer(&b.entries[idx])
+				if eptr != nil {
+					e := (*entry[K, V])(eptr)
+					if e.key == key {
+						if loadOp == loadOrComputeOp {
+							return e.value, true
 						}
+						oldv = e.value
+						loaded = true
+						// The entry pointer acts as a version token
+						// for the optimistic read: entries are
+						// immutable and updates swap the pointer, so
+						// any concurrent modification of the key
+						// changes it. Keeping the pointer alive also
+						// prevents the runtime from recycling the
+						// entry's memory for a new entry while no
+						// lock is held.
+						oldEntry = e
+						break load
 					}
-					markedw &= markedw - 1
 				}
-				bptr := atomic.LoadPointer(&b.next)
-				if bptr == nil {
-					if loadOp == loadAndDeleteOp {
-						return *new(V), false
-					}
-					break load
-				}
-				b = (*bucketPadded)(bptr)
+				markedw &= markedw - 1
 			}
+			bptr := atomic.LoadPointer(&b.next)
+			if bptr == nil {
+				if loadOp == loadAndDeleteOp {
+					return *new(V), false
+				}
+				break load
+			}
+			b = (*bucketPadded)(bptr)
 		}
+
+		// The compute function runs without any locks held, so it
+		// may safely call back into the map. It may be called
+		// multiple times in case of concurrent modifications of
+		// the key: the attempt is retried then.
+		newv, op := valueFn(oldv, loaded)
 
 		rootb.mu.Lock()
 		// The following two checks must go in reverse to what's
@@ -650,7 +675,7 @@ func (m *Map[K, V]) doCompute(
 			rootb.mu.Unlock()
 			goto compute_attempt
 		}
-		b := rootb
+		b = rootb
 		for {
 			metaw := b.meta
 			markedw := markZeroBytes(metaw^h2w) & metaMask
@@ -660,13 +685,15 @@ func (m *Map[K, V]) doCompute(
 				if eptr != nil {
 					e := (*entry[K, V])(eptr)
 					if e.key == key {
+						if !loaded || e != oldEntry {
+							// The entry was concurrently inserted,
+							// updated or deleted. Go for another
+							// attempt, so that the compute function
+							// observes the most recent state.
+							rootb.mu.Unlock()
+							goto compute_attempt
+						}
 						// In-place update/delete.
-						// We get a copy of the value via an interface{} on each call,
-						// thus the live value pointers are unique. Otherwise atomic
-						// snapshot won't be correct in case of multiple Store calls
-						// using the same value.
-						oldv := e.value
-						newv, op := valueFn(oldv, true)
 						switch op {
 						case DeleteOp:
 							// Deletion.
@@ -710,24 +737,30 @@ func (m *Map[K, V]) doCompute(
 				}
 			}
 			if b.next == nil {
+				if loaded {
+					// The entry was concurrently deleted. Go for
+					// another attempt, so that the compute function
+					// observes the most recent state.
+					rootb.mu.Unlock()
+					goto compute_attempt
+				}
 				if emptyb != nil {
 					// Insertion into an existing bucket.
-					var zeroV V
-					newValue, op := valueFn(zeroV, false)
 					switch op {
 					case DeleteOp, CancelOp:
 						rootb.mu.Unlock()
+						var zeroV V
 						return zeroV, false
 					default:
 						newe := new(entry[K, V])
 						newe.key = key
-						newe.value = newValue
+						newe.value = newv
 						// First we update meta, then the entry.
 						atomic.StoreUint64(&emptyb.meta, setByte(emptyb.meta, h2, emptyidx))
 						atomic.StorePointer(&emptyb.entries[emptyidx], unsafe.Pointer(newe))
 						rootb.mu.Unlock()
 						table.addSize(bidx, 1)
-						return newValue, computeOnly
+						return newv, computeOnly
 					}
 				}
 				growThreshold := float64(tableLen) * entriesPerMapBucket * mapLoadFactor
@@ -738,11 +771,10 @@ func (m *Map[K, V]) doCompute(
 					goto compute_attempt
 				}
 				// Insertion into a new bucket.
-				var zeroV V
-				newValue, op := valueFn(zeroV, false)
 				switch op {
 				case DeleteOp, CancelOp:
 					rootb.mu.Unlock()
+					var zeroV V
 					return zeroV, false
 				default:
 					// Create and append a bucket.
@@ -750,12 +782,12 @@ func (m *Map[K, V]) doCompute(
 					newb.meta = setByte(0, h2, 0)
 					newe := new(entry[K, V])
 					newe.key = key
-					newe.value = newValue
+					newe.value = newv
 					newb.entries[0] = unsafe.Pointer(newe)
 					atomic.StorePointer(&b.next, unsafe.Pointer(newb))
 					rootb.mu.Unlock()
 					table.addSize(bidx, 1)
-					return newValue, computeOnly
+					return newv, computeOnly
 				}
 			}
 			b = (*bucketPadded)(b.next)

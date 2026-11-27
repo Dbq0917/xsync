@@ -1114,6 +1114,47 @@ func TestMapCompute_CancelOpOnOverflowBucket(t *testing.T) {
 	}
 }
 
+func TestMapCompute_ReentrantCallback(t *testing.T) {
+	// The compute function runs without any locks held, so calling
+	// back into the map from it must not deadlock. A nested Compute
+	// for the same key is guaranteed to hit the same bucket, which
+	// used to self-deadlock when the callback ran under the bucket
+	// lock.
+	m := NewMap[string, int]()
+	m.Store("foo", 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var reentered bool
+		m.Compute("foo", func(oldValue int, loaded bool) (newValue int, op ComputeOp) {
+			if !loaded || oldValue != 1 {
+				t.Errorf("expected oldValue=1, loaded=true, got %d, %v", oldValue, loaded)
+			}
+			if !reentered {
+				reentered = true
+				if v, ok := m.Compute("foo", func(v int, ok bool) (int, ComputeOp) {
+					return v, CancelOp
+				}); !ok || v != 1 {
+					t.Errorf("expected nested Compute to see foo=1, got %d, %v", v, ok)
+				}
+				m.Store("bar", 42)
+			}
+			return oldValue + 1, UpdateOp
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Compute with a reentrant callback deadlocked")
+	}
+	if v, ok := m.Load("foo"); !ok || v != 2 {
+		t.Fatalf("expected foo=2, got %d, %v", v, ok)
+	}
+	if v, ok := m.Load("bar"); !ok || v != 42 {
+		t.Fatalf("expected bar=42, got %d, %v", v, ok)
+	}
+}
+
 func testMapStoreThenDeleteKeys[K integerKey](t *testing.T, numEntries int) {
 	t.Helper()
 	m := NewMap[K, K]()
